@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,10 +98,16 @@ class ParsedFile:
 
 
 def node_text(node: Node, source: str | bytes) -> str:
-    """Extract the text content of a node."""
-    if isinstance(source, bytes):
-        return source[node.start_byte : node.end_byte].decode("utf-8")
-    return source[node.start_byte : node.end_byte]
+    """Extract the text content of a node.
+
+    Tree-sitter node offsets are *byte* offsets, so a ``str`` source must be
+    encoded before slicing — otherwise any multi-byte character earlier in the
+    file (e.g. a German umlaut in a comment) shifts byte vs. character position
+    and truncates every later node's text.
+    """
+    if isinstance(source, str):
+        source = source.encode("utf-8")
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
 def iter_nodes(
@@ -121,6 +128,25 @@ def find_nodes_by_type(node: Node, node_type: str) -> Iterator[Node]:
     for child, _ in iter_nodes(node):
         if child.type == node_type:
             yield child
+
+
+def sanitize_source(source: str) -> str:
+    """Strip control characters that corrupt fixed-form column alignment.
+
+    IBM-i source exports frequently contain stray C0/C1 control characters —
+    most notably a U+0082 prefix on every line from an EBCDIC-to-UTF-8
+    conversion glitch. Because fixed-form RPG is column-sensitive (the spec
+    type lives in column 6), a single leading control byte shifts every
+    column and breaks both the scanner and the column-based analysis. We drop
+    all Unicode "Cc" (control) characters except tab, newline and carriage
+    return, leaving printable content — including legitimate non-ASCII bytes
+    such as ``§`` — untouched.
+    """
+    return "".join(
+        ch
+        for ch in source
+        if ch in "\t\n\r" or unicodedata.category(ch) != "Cc"
+    )
 
 
 class RPGParser:
@@ -173,7 +199,7 @@ class RPGParser:
         Returns:
             The Tree-sitter parse tree.
         """
-        return self._parser.parse(source.encode("utf-8"))
+        return self._parser.parse(sanitize_source(source).encode("utf-8"))
 
     def parse_file(self, path: str | Path) -> Tree:
         """Parse an RPG source file.
@@ -185,7 +211,7 @@ class RPGParser:
             The Tree-sitter parse tree.
         """
         path = Path(path)
-        source = path.read_text(encoding="utf-8")
+        source = path.read_text(encoding="utf-8", errors="replace")
         return self.parse_code(source, str(path))
 
     def parse_to_parsed_file(self, path: str | Path) -> ParsedFile:
@@ -198,7 +224,10 @@ class RPGParser:
             A ParsedFile containing the tree and source.
         """
         path = Path(path)
-        source = path.read_text(encoding="utf-8")
+        # Sanitize once and keep the cleaned text as the file's source: the
+        # parse tree's byte offsets index into these exact bytes, so the
+        # analysis layer must read from the same sanitized string.
+        source = sanitize_source(path.read_text(encoding="utf-8", errors="replace"))
         tree = self.parse_code(source, str(path))
         return ParsedFile(path=str(path), tree=tree, source=source)
 

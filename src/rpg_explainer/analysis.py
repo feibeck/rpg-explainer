@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
@@ -12,6 +13,68 @@ from .parser import ParsedFile, find_nodes_by_type, iter_nodes, node_text
 
 if TYPE_CHECKING:
     from tree_sitter import Node
+
+
+# --- Migration-lineage extraction helpers -------------------------------------
+
+# The copybook reference following /COPY or /INCLUDE, e.g. "QSRCC,HSPEC".
+_COPY_RE = re.compile(r"/(?:copy|include)\s+(\S+)", re.IGNORECASE)
+
+# Start marker of an embedded-SQL statement.
+_EXEC_SQL_RE = re.compile(r"exec\s+sql\b", re.IGNORECASE)
+
+# A (possibly schema-qualified) DB2 table name.
+_TBL = r"[A-Za-z_#@$][\w#@$./]*"
+
+# Verb-specific write clauses: (operation, direction, pattern).
+_SQL_WRITE_PATTERNS = [
+    ("INSERT", "write", re.compile(r"\binsert\s+into\s+(" + _TBL + r")", re.IGNORECASE)),
+    ("UPDATE", "write", re.compile(r"\bupdate\s+(" + _TBL + r")", re.IGNORECASE)),
+    ("DELETE", "write", re.compile(r"\bdelete\s+from\s+(" + _TBL + r")", re.IGNORECASE)),
+    ("MERGE", "write", re.compile(r"\bmerge\s+into\s+(" + _TBL + r")", re.IGNORECASE)),
+]
+_SQL_FROM_RE = re.compile(r"\bfrom\s+(" + _TBL + r")", re.IGNORECASE)
+_SQL_JOIN_RE = re.compile(r"\bjoin\s+(" + _TBL + r")", re.IGNORECASE)
+
+
+def _iter_sql_statements(source: str) -> Iterator[str]:
+    """Yield the text of each embedded-SQL statement (marker stripped, up to ;).
+
+    Statements routinely wrap across several source lines, so lines after the
+    ``Exec Sql`` marker are joined until the terminating ``;``.
+    """
+    lines = source.split("\n")
+    n = len(lines)
+    i = 0
+    while i < n:
+        marker = _EXEC_SQL_RE.search(lines[i])
+        if marker is None:
+            i += 1
+            continue
+        buf = lines[i][marker.end():]
+        j = i
+        while ";" not in buf and j + 1 < n:
+            j += 1
+            buf += " " + lines[j]
+        yield buf.split(";", 1)[0].strip()
+        i = j + 1
+
+
+def _sql_touchpoints(stmt: str) -> list[tuple[str, str, str]]:
+    """Return (operation, table, direction) tuples for one SQL statement."""
+    results: list[tuple[str, str, str]] = []
+    writes: set[str] = set()
+    for op, direction, rx in _SQL_WRITE_PATTERNS:
+        for m in rx.finditer(stmt):
+            table = m.group(1)
+            results.append((op, table, direction))
+            writes.add(table.lower())
+    for rx in (_SQL_FROM_RE, _SQL_JOIN_RE):
+        for m in rx.finditer(stmt):
+            table = m.group(1)
+            if table.lower() not in writes:  # skip DELETE FROM / write targets
+                results.append(("SELECT", table, "read"))
+    return results
 
 
 @dataclass
@@ -81,6 +144,28 @@ class RPGFixedSpec:
 
 
 @dataclass
+class RPGCopyInclude:
+    """Represents a /COPY or /INCLUDE copybook dependency."""
+
+    member: str
+    source_file: str | None = None
+    raw: str = ""
+
+
+@dataclass
+class RPGSqlTarget:
+    """Represents an embedded-SQL data touchpoint (a lineage edge).
+
+    ``direction`` is ``"read"`` for SELECT/FETCH and ``"write"`` for
+    INSERT/UPDATE/DELETE/MERGE. Best-effort text extraction (see ADR-0002).
+    """
+
+    operation: str
+    table: str
+    direction: str
+
+
+@dataclass
 class RPGFile:
     """Represents a parsed RPG source file with extracted information."""
 
@@ -97,6 +182,9 @@ class RPGFile:
     fixed_d_specs: list[RPGFixedSpec] = field(default_factory=list)
     fixed_c_specs: list[RPGFixedSpec] = field(default_factory=list)
     fixed_p_specs: list[RPGFixedSpec] = field(default_factory=list)
+    # Migration-lineage touchpoints
+    copybooks: list[RPGCopyInclude] = field(default_factory=list)
+    sql_targets: list[RPGSqlTarget] = field(default_factory=list)
 
 
 @dataclass
@@ -291,7 +379,59 @@ class RPGAnalyzer:
         # Extract fixed-form specs
         self._extract_fixed_form_specs(rpg_file, root, source)
 
+        # Extract migration-lineage touchpoints
+        self._extract_copybooks(rpg_file, root, source)
+        self._extract_sql_targets(rpg_file, source)
+
         return rpg_file
+
+    def _extract_copybooks(
+        self, rpg_file: RPGFile, root: Node, source: str
+    ) -> None:
+        """Extract /COPY and /INCLUDE copybook dependencies.
+
+        The scanner emits each directive as a single ``copy_directive`` token
+        spanning the whole line, regardless of what the sequence-number area
+        holds (e.g. a ``CPY`` label). We pull the copybook reference from the
+        line text.
+        """
+        seen: set[tuple[str | None, str]] = set()
+        for node in find_nodes_by_type(root, "copy_directive"):
+            line = node_text(node, source)
+            match = _COPY_RE.search(line)
+            if not match:
+                continue
+            ref = match.group(1).strip().strip("'\"")
+            # Reference may be "srcfile,member" or "lib/srcfile,member" or "member".
+            if "," in ref:
+                src, member = ref.rsplit(",", 1)
+                src = src or None
+            else:
+                src, member = None, ref
+            key = (src, member)
+            if member and key not in seen:
+                seen.add(key)
+                rpg_file.copybooks.append(
+                    RPGCopyInclude(member=member, source_file=src, raw=ref)
+                )
+
+    def _extract_sql_targets(self, rpg_file: RPGFile, source: str) -> None:
+        """Extract embedded-SQL table touchpoints as directional lineage edges.
+
+        Best-effort text scan (see ADR-0002): each ``Exec Sql`` statement is
+        read up to its terminating ``;``, the leading verb gives the operation
+        and direction, and the table is taken from the verb-specific clause.
+        Multi-line statements (the common case) are joined first.
+        """
+        seen: set[tuple[str, str]] = set()
+        for stmt in _iter_sql_statements(source):
+            for op, table, direction in _sql_touchpoints(stmt):
+                key = (op, table)
+                if key not in seen:
+                    seen.add(key)
+                    rpg_file.sql_targets.append(
+                        RPGSqlTarget(operation=op, table=table, direction=direction)
+                    )
 
     def _extract_fixed_form_specs(
         self, rpg_file: RPGFile, root: Node, source: str

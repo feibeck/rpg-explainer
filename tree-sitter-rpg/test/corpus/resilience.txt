@@ -1,0 +1,66 @@
+================================================================
+/COPY directive with label in the sequence-number area
+================================================================
+
+CPY  /COPY QSRCC,HSPEC
+
+----
+
+(source_file
+  (copy_directive))
+
+================================================================
+Fixed-form full-line comment (star in column 6)
+================================================================
+
+     * comment col 6
+
+----
+
+(source_file
+  (fixed_comment_line))
+
+================================================================
+Free-form calc in a fixed member is absorbed as unknown_line
+================================================================
+
+ B01   If x;
+
+----
+
+(source_file
+  (unknown_line))
+
+================================================================
+No cascade: a copy directive and an opaque line do not swallow
+the following fixed spec
+================================================================
+
+CPY  /COPY QSRCC,HSPEC
+ B01   If x;
+     D myvar           S             10A
+
+----
+
+(source_file
+  (copy_directive)
+  (unknown_line)
+  (fixed_d_spec
+    (fixed_d_line)))
+
+================================================================
+**FREE members keep parsing as free-form
+================================================================
+
+**FREE
+dcl-s x int(10);
+
+----
+
+(source_file
+  (free_directive)
+  (variable_definition
+    name: (identifier)
+    (identifier)
+    (paren_group
+      (number_literal))))

@@ -29,7 +29,9 @@ module.exports = grammar({
     $.fixed_c_line,
     $.fixed_p_line,
     $.fixed_comment_line,
+    $.copy_directive,   // /COPY or /INCLUDE directive line (scanner-emitted)
     $.free_directive,
+    $.unknown_line,     // any fixed-mode line the scanner does not classify
     $._newline,  // Scanner handles newlines based on mode
   ],
 
@@ -54,7 +56,9 @@ module.exports = grammar({
       $.fixed_c_spec,
       $.fixed_p_spec,
       $.fixed_comment_line,
+      $.copy_directive,
       $.free_directive,
+      $.unknown_line,
       // Free-form declarations and statements
       $.procedure_definition,
       $.file_definition,
