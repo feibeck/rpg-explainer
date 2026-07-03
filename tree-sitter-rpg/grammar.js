@@ -44,6 +44,13 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  conflicts: $ => [
+    // Standalone DS (dcl-ds ...;) vs. a DS whose subfield block follows:
+    // after the header `;` the parser may reduce the DS or continue into the
+    // subfield repeat. Resolved at runtime by dynamic precedence.
+    [$.data_structure_definition],
+  ],
+
   rules: {
     // Top-level: just a sequence of declarations and statements
     source_file: $ => repeat($._item),
@@ -75,6 +82,7 @@ module.exports = grammar({
       $.select_statement,
       $.monitor_statement,
       $.return_statement,
+      $.exec_sql_statement,
       $.simple_statement
     ),
 
@@ -119,16 +127,25 @@ module.exports = grammar({
       ';'
     ),
 
-    // Data structure: DCL-DS name ... ; ... END-DS ;
+    // Data structure. Two shapes:
+    //   * block form:      DCL-DS name ... ; subfields... END-DS ;
+    //   * standalone form: DCL-DS name ... ;   (LIKEDS / TEMPLATE / no subfields)
+    // The END-DS block is optional so self-contained declarations parse.
     data_structure_definition: $ => seq(
       ci('dcl-ds'),
       field('name', $._name),
       repeat($._token),
       ';',
-      repeat($.subfield_definition),
-      ci('end-ds'),
-      optional($._name),
-      ';'
+      // Dynamic precedence biases the parser toward the block interpretation
+      // when an END-DS is actually present, so real block data structures keep
+      // their subfield structure; a standalone DS (LIKEDS / TEMPLATE, no
+      // END-DS) falls back to the empty `optional`.
+      optional(prec.dynamic(1, seq(
+        repeat(choice($.subfield_definition, $.preprocessor_directive)),
+        ci('end-ds'),
+        optional($._name),
+        ';'
+      )))
     ),
 
     subfield_definition: $ => seq(
@@ -144,7 +161,7 @@ module.exports = grammar({
       field('name', $._name),
       repeat($._token),
       ';',
-      repeat($.parameter_definition),
+      repeat(choice($.parameter_definition, $.preprocessor_directive)),
       ci('end-pr'),
       optional($._name),
       ';'
@@ -156,7 +173,7 @@ module.exports = grammar({
       field('name', $._name),
       repeat($._token),
       ';',
-      repeat($.parameter_definition),
+      repeat(choice($.parameter_definition, $.preprocessor_directive)),
       ci('end-pi'),
       optional($._name),
       ';'
@@ -184,6 +201,9 @@ module.exports = grammar({
     _proc_item: $ => choice(
       $.procedure_interface,
       $.variable_definition,
+      $.constant_definition,
+      $.data_structure_definition,
+      $.preprocessor_directive,
       $.if_statement,
       $.dow_statement,
       $.dou_statement,
@@ -191,6 +211,7 @@ module.exports = grammar({
       $.select_statement,
       $.monitor_statement,
       $.return_statement,
+      $.exec_sql_statement,
       $.simple_statement
     ),
 
@@ -291,6 +312,24 @@ module.exports = grammar({
       ';'
     ),
 
+    // Embedded SQL. We do NOT model SQL (see ADR-0002): the statement is
+    // consumed as an opaque node up to its terminating `;` so it cannot cascade
+    // in free-form members, while the analysis layer extracts table targets by
+    // regex. `prec` makes `Exec Sql ...` win over a generic simple_statement.
+    exec_sql_statement: $ => prec(1, seq(
+      ci('exec'),
+      ci('sql'),
+      repeat($._sql_atom),
+      ';'
+    )),
+
+    // Permissive SQL body: RPG tokens plus the host-variable colon and commas.
+    _sql_atom: $ => choice(
+      $._token,
+      ':',
+      ','
+    ),
+
     // Simple statement (expression statement)
     simple_statement: $ => seq(
       repeat1($._token),
@@ -332,9 +371,10 @@ module.exports = grammar({
 
     _name: $ => choice($.identifier, $.special_identifier),
 
-    // Lexical tokens
-    identifier: $ => /[A-Za-z_#@$][A-Za-z0-9_#@$]*/,
-    special_identifier: $ => /\*[A-Za-z0-9_#@$]+/,
+    // Lexical tokens. `§` (U+00A7) is a legal national character in IBM-i
+    // identifiers and is used heavily as a constant prefix in these members.
+    identifier: $ => /[A-Za-z_#@$§][A-Za-z0-9_#@$§]*/,
+    special_identifier: $ => /\*[A-Za-z0-9_#@$§]+/,
     builtin_function: $ => /%[A-Za-z_][A-Za-z0-9_]*/,
     number_literal: $ => /-?\d+(\.\d+)?([eE][+-]?\d+)?/,
     string_literal: $ => token(choice(

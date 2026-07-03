@@ -162,3 +162,59 @@ class TestSqlExtraction:
         edges = [(t.operation, t.table, t.direction) for t in rpg.sql_targets]
         assert ("DELETE", "STAGING", "write") in edges
         assert ("SELECT", "STAGING", "read") not in edges
+
+
+class TestFreeFormDeclarations:
+    """`**FREE` members with likeds/like/§ declarations and embedded SQL."""
+
+    def test_standalone_likeds_ds_without_end_ds(self, parser):
+        code = "**FREE\ndcl-ds fids_ARTSTS3P likeds(ga_INFDS_T);\n"
+        tree = parser.parse_code(code)
+        assert not tree.root_node.has_error
+
+    def test_like_with_paragraph_sign_identifier(self, parser):
+        # `§` (U+00A7) is a legal national character used as a constant prefix.
+        code = "**FREE\ndcl-s isDone like(r§BOOL) inz(§False);\n"
+        tree = parser.parse_code(code)
+        assert not tree.root_node.has_error
+
+    def test_block_ds_still_keeps_subfields(self, parser, analyzer):
+        # The standalone-DS relaxation must not break the block form.
+        code = (
+            "**FREE\n"
+            "dcl-ds rec qualified;\n"
+            "  id int(10);\n"
+            "  name char(20);\n"
+            "end-ds;\n"
+        )
+        tree = parser.parse_code(code)
+        assert not tree.root_node.has_error
+        rpg = _analyze(parser, analyzer, code)
+        assert any(ds.name == "rec" for ds in rpg.data_structures)
+
+    def test_embedded_sql_is_opaque_and_extracted(self, parser, analyzer):
+        # Multi-line SQL with a host variable must not cascade, and the table
+        # target is still pulled out by the regex extractor.
+        code = (
+            "**FREE\n"
+            "        Exec Sql\n"
+            "          select count(fa) into :p_anz from ARTMKT\n"
+            "          where fa = :i_fa;\n"
+        )
+        tree = parser.parse_code(code)
+        assert not tree.root_node.has_error
+        rpg = _analyze(parser, analyzer, code)
+        assert ("SELECT", "ARTMKT", "read") in [
+            (t.operation, t.table, t.direction) for t in rpg.sql_targets
+        ]
+
+    def test_copy_directive_inside_prototype(self, parser):
+        # /COPY brings in a prototype's parameters between the header and end-pr.
+        code = (
+            "**FREE\n"
+            "dcl-pr B3_ChkLief ind extproc('B3_CHKLIEF');\n"
+            "/COPY QSRCC,B3LF_PR\n"
+            "end-pr;\n"
+        )
+        tree = parser.parse_code(code)
+        assert not tree.root_node.has_error
